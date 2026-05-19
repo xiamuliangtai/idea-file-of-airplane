@@ -1,0 +1,512 @@
+地面站工程中“网格坐标转换”相关代码摘录
+================================================
+
+说明
+----
+根据当前 ground-station-ros-1.11- 工程，地面站里目前没有发现“网格坐标 -> 真实物理坐标（米 / 厘米）”的完整比例换算代码。
+当前已有的坐标转换主要包括：
+
+1. UI 表格点击坐标 -> 地面站内部网格坐标
+2. 地面站内部网格坐标 -> UI 显示坐标 A/B
+3. 禁飞区网格坐标 -> 一维编号 code
+4. 一维编号 code -> planner 内部 row/col
+5. planner 内部 row/col -> Waypoint(x,y)
+6. Waypoint(x,y) -> UI 绘图 QPoint
+7. 网格坐标 -> 地图图片像素坐标
+8. Waypoint(x,y) -> 发送给 STM32 的串口协议坐标
+
+当前坐标体系
+------------
+1. 地面站内部规划坐标：
+   - col 范围：1 ~ 9
+   - row 范围：1 ~ 7
+   - 内部固定起点：QPoint(9, 7)
+
+2. UI 显示坐标：
+   - A = col
+   - B = 8 - internal_row
+   - 因此内部 QPoint(9, 7) 显示为 (A9, B1)
+
+3. 发给 STM32 的坐标：
+   - 如果按之前最小改法执行，应在 bridge_node.cpp 发送前做：tx_row = 8 - row
+   - 这样内部 (9,7) 发送给 STM32 时变成 (9,1)
+
+
+================================================
+一、UI 表格点击坐标 -> 地面站内部网格坐标
+文件：src/ui_node/src/mainwindow.cpp
+函数：MainWindow::onCellClicked(int row, int col)
+================================================
+
+void MainWindow::onCellClicked(int row, int col)
+{
+    qDebug() << col << "," << row;
+
+    if (row == 7 || col == 0) {
+        return;
+    }
+
+    QTableWidgetItem *item = ui->tableWidget->item(row, col);
+    if (!item) {
+        return;
+    }
+
+    if (item->background().color() == Qt::red) {
+        item->setBackground(Qt::white);
+        count--;
+        for (int i = 0; i < m_block.size(); ++i) {
+            if (m_block[i] == QPoint(col, row + 1)) {
+                m_block.removeAt(i);
+                break;
+            }
+        }
+        updateBlockedLabels();
+        return;
+    }
+
+    if (count >= 3) {
+        return;
+    }
+
+    item->setBackground(Qt::red);
+    m_block.append(QPoint(col, row + 1));
+    count++;
+    updateBlockedLabels();
+}
+
+解释：
+- QTableWidget 的 row 是从 0 开始的表格行号。
+- 地面站内部 row 使用 1 ~ 7。
+- 因此点击表格后保存为 QPoint(col, row + 1)。
+- 这一步得到的是“内部规划网格坐标”，不是 UI 显示的 B 坐标。
+
+
+================================================
+二、内部网格坐标 -> UI 显示坐标 A/B
+文件：src/ui_node/src/mainwindow.cpp
+函数：MainWindow::updateBlockedLabels()
+================================================
+
+void MainWindow::updateBlockedLabels()
+{
+    if (m_block.size() != 3) {
+        ui->label_2->setText("NULL");
+        ui->label_3->setText("NULL");
+        ui->label_4->setText("NULL");
+        return;
+    }
+
+    const QString str1 = "(A" + QString::number(m_block[0].x()) + ",B" + QString::number(8 - m_block[0].y()) + ")";
+    const QString str2 = "(A" + QString::number(m_block[1].x()) + ",B" + QString::number(8 - m_block[1].y()) + ")";
+    const QString str3 = "(A" + QString::number(m_block[2].x()) + ",B" + QString::number(8 - m_block[2].y()) + ")";
+
+    ui->label_2->setText(str1);
+    ui->label_3->setText(str2);
+    ui->label_4->setText(str3);
+}
+
+解释：
+- A 坐标直接使用内部 col。
+- B 坐标使用 8 - internal_row。
+- 例如：
+  - 内部 (9,7) -> UI 显示 (A9,B1)
+  - 内部 (9,1) -> UI 显示 (A9,B7)
+
+
+================================================
+三、禁飞区内部网格坐标 -> 一维 code
+文件：src/ui_node/src/ros_interface.cpp
+函数：RosInterface::publishNoFlyCells(const QList<QPoint>& blocks)
+================================================
+
+void RosInterface::publishNoFlyCells(const QList<QPoint>& blocks)
+{
+    if (!initialized_ || !noFlyPub_) {
+        qDebug() << "[RosInterface] publisher not ready, skip publish";
+        return;
+    }
+
+    gs_msgs::NoFlyCells msg;
+
+    for (const QPoint& p : blocks) {
+        int col = p.x();
+        int row = p.y();
+
+        if (col < 1 || col > 9 || row < 1 || row > 7) {
+            qDebug() << "[RosInterface] skip invalid block:" << p;
+            continue;
+        }
+
+        uint8_t code = static_cast<uint8_t>((row - 1) * 9 + col);
+        msg.cells.push_back(code);
+    }
+
+    qDebug() << "[RosInterface] publish /ui/no_fly_cells, count =" << msg.cells.size();
+    noFlyPub_.publish(msg);
+}
+
+解释：
+- 这里把二维网格坐标 (col,row) 编成一维编号 code。
+- 编码公式：code = (row - 1) * 9 + col
+- row 和 col 使用的是地面站内部网格坐标。
+- code 范围理论为 1 ~ 63。
+
+
+================================================
+四、一维 code -> planner 内部 row/col
+文件：src/planner_node/src/planner_node.cpp
+函数：PlannerNode::parseBlockedCells(...)
+================================================
+
+Grid parseBlockedCells(const gs_msgs::NoFlyCells::ConstPtr& msg) const
+{
+    Grid grid;
+    grid.total_free = kRows * kCols;
+
+    for (std::size_t i = 0; i < msg->cells.size(); ++i) {
+        int code = static_cast<int>(msg->cells[i]);
+        int row = (code - 1) / kCols + 1;
+        int col = (code - 1) % kCols + 1;
+
+        if (inBoundsRC(row, col) && !grid.blocked[row][col]) {
+            grid.blocked[row][col] = true;
+            --grid.total_free;
+        }
+    }
+
+    return grid;
+}
+
+解释：
+- planner 收到 /ui/no_fly_cells 后，把 code 还原为 row/col。
+- 解码公式：
+  row = (code - 1) / 9 + 1
+  col = (code - 1) % 9 + 1
+- planner 内部使用 CellRC(row,col)，即先 row 后 col。
+
+
+================================================
+五、planner 内部 row/col -> 外部 Cell(col,row)
+文件：src/planner_node/src/planner_node.cpp
+函数：PlannerNode::fromRC(...)
+================================================
+
+using Cell = std::pair<int, int>;    // external: (col, row)
+using CellRC = std::pair<int, int>;  // internal: (row, col)
+
+static Cell fromRC(const CellRC& p)
+{
+    return Cell(p.second, p.first);
+}
+
+解释：
+- planner 内部路径点类型为 CellRC(row,col)。
+- 对外发布路径时转换成 Cell(col,row)。
+- 即：external_col = internal_col，external_row = internal_row。
+
+
+================================================
+六、planner 路径点 -> Waypoint(x,y)
+文件：src/planner_node/src/planner_node.cpp
+函数：PlannerNode::makeGridWaypoint(int col, int row)
+================================================
+
+static gs_msgs::Waypoint makeGridWaypoint(int col, int row)
+{
+    gs_msgs::Waypoint wp;
+    wp.x = static_cast<float>(col);
+    wp.y = static_cast<float>(row);
+    wp.z = 0.0f;
+    wp.type = 0;
+    wp.hold_ms = 0;
+    return wp;
+}
+
+解释：
+- planner 发布 /planner/path 时，把网格 col,row 放入 Waypoint。
+- Waypoint.x = col。
+- Waypoint.y = row。
+- 这仍然是网格坐标，不是米/厘米坐标。
+
+
+================================================
+七、Waypoint(x,y) -> UI 绘图 QPoint(col,row)
+文件：src/ui_node/src/mainwindow.cpp
+函数：MainWindow::onPathAvailable()
+================================================
+
+void MainWindow::onPathAvailable()
+{
+    gs_msgs::WaypointArray msg;
+    if (!rosIf_->takeLatestPath(msg)) {
+        qDebug() << "[MainWindow] onPathAvailable but no pending path";
+        return;
+    }
+
+    qDebug() << "[MainWindow] onPathAvailable, points =" << msg.points.size();
+
+    QList<QPoint> path;
+    for (const auto& p : msg.points) {
+        int col = static_cast<int>(p.x);
+        int row = static_cast<int>(p.y);
+        path.append(QPoint(col, row));
+    }
+
+    drawPathOnLabel(path);
+}
+
+解释：
+- UI 收到 /planner/path 后，把 Waypoint.x/y 转成 QPoint(col,row)。
+- 这里仍然使用内部/规划网格坐标。
+
+
+================================================
+八、网格坐标 -> 地图图片像素坐标
+文件：src/ui_node/src/mainwindow.cpp
+函数：MainWindow::gridToPixel(int col, int row)
+================================================
+
+QPoint MainWindow::gridToPixel(int col, int row)
+{
+    int w = 131;
+    int h = 133;
+    int x = static_cast<int>(w * 0.5) + (col - 1) * w + 158;
+    int y = static_cast<int>(h * 0.5) + (row - 1) * h + 75;
+    return QPoint(x, y);
+}
+
+解释：
+- 这是当前工程中最接近“网格坐标 -> 现实显示坐标”的代码。
+- 它实际转换的是“网格坐标 -> UI 地图图片上的像素坐标”。
+- 公式：
+  x_pixel = 0.5 * 131 + (col - 1) * 131 + 158
+  y_pixel = 0.5 * 133 + (row - 1) * 133 + 75
+- 其中：
+  w = 131：单格像素宽度
+  h = 133：单格像素高度
+  158：地图起始 X 偏移
+  75：地图起始 Y 偏移
+
+
+================================================
+九、路径绘图时使用 gridToPixel
+文件：src/ui_node/src/mainwindow.cpp
+函数：MainWindow::drawPathOnLabel(...)
+================================================
+
+void MainWindow::drawPathOnLabel(const QList<QPoint>& path)
+{
+    qDebug() << "[drawPathOnLabel] enter";
+
+    const QPixmap* originalPix = ui->label->pixmap();
+    if (!originalPix) {
+        qDebug() << "[drawPathOnLabel] originalPix is null";
+        QMessageBox::warning(this, "警告", "标签上没有图片");
+        return;
+    }
+
+    QPixmap tempMap = *originalPix;
+    QPainter painter(&tempMap);
+    QPen pen(Qt::red);
+    pen.setWidth(8);
+    painter.setPen(pen);
+
+    qDebug() << "[drawPathOnLabel] painter ok, path size =" << path.size();
+
+    if (path.isEmpty()) {
+        qDebug() << "[drawPathOnLabel] path empty";
+        QMessageBox::information(this, "提示", "找不到合法路径");
+        return;
+    }
+
+    for (int i = 1; i < path.size(); ++i) {
+        const QPoint& p0 = path[i - 1];
+        const QPoint& p1 = path[i];
+
+        if (!isStraightSegmentClear(p0, p1, m_block)) {
+            qDebug() << "[drawPathOnLabel] skip invalid segment:" << p0 << "->" << p1;
+            continue;
+        }
+
+        QPoint a = gridToPixel(p0.x(), p0.y());
+        QPoint b = gridToPixel(p1.x(), p1.y());
+        painter.drawLine(a, b);
+    }
+
+    ui->label->setPixmap(tempMap);
+    ui->pushButton->setEnabled(false);
+
+    resetAnimalStats();
+
+    qDebug() << "[drawPathOnLabel] exit";
+}
+
+解释：
+- drawPathOnLabel 里调用 gridToPixel，把网格路径点转换为地图图片像素点。
+- 然后使用 painter.drawLine(a,b) 在地图图片上画路径。
+
+
+================================================
+十、路径点发送给 STM32 前的坐标处理
+文件：src/stm32_bridge_node/src/bridge_node.cpp
+函数：BridgeNode::buildUploadPathFrame(...)
+================================================
+
+注意：
+当前 GitHub main 分支中，该函数原始逻辑是直接发送 col,row。
+如果你已经采用“对 STM32 统一发送外部坐标，固定起点 (9,1)”的最小改法，
+则下面应当使用 tx_row = 8 - row。
+
+推荐版关键代码如下：
+
+const int col = static_cast<int>(std::lround(p.x));
+const int row = static_cast<int>(std::lround(p.y));
+
+if (std::fabs(p.x - static_cast<float>(col)) > 1e-4f) {
+    std::ostringstream oss;
+    oss << "point[" << i << "] x is not grid-like integer value: " << p.x;
+    error = oss.str();
+    frame.clear();
+    return false;
+}
+
+if (std::fabs(p.y - static_cast<float>(row)) > 1e-4f) {
+    std::ostringstream oss;
+    oss << "point[" << i << "] y is not grid-like integer value: " << p.y;
+    error = oss.str();
+    frame.clear();
+    return false;
+}
+
+if (col < 1 || col > 9) {
+    std::ostringstream oss;
+    oss << "point[" << i << "] col out of range [1,9]: " << col;
+    error = oss.str();
+    frame.clear();
+    return false;
+}
+
+if (row < 1 || row > 7) {
+    std::ostringstream oss;
+    oss << "point[" << i << "] internal row out of range [1,7]: " << row;
+    error = oss.str();
+    frame.clear();
+    return false;
+}
+
+// planner 内部坐标保持不变，只在发给 STM32 时做行坐标映射。
+// 内部 row=7 -> 发送 row=1
+// 内部 row=1 -> 发送 row=7
+const int tx_row = 8 - row;
+
+if (tx_row < 1 || tx_row > 7) {
+    std::ostringstream oss;
+    oss << "point[" << i << "] tx_row out of range [1,7]: " << tx_row;
+    error = oss.str();
+    frame.clear();
+    return false;
+}
+
+frame.push_back(static_cast<uint8_t>(col));
+frame.push_back(static_cast<uint8_t>(tx_row));
+frame.push_back(static_cast<uint8_t>(p.type));
+appendUint16LE(frame, static_cast<uint16_t>(p.hold_ms));
+frame.push_back(0x00);
+
+解释：
+- planner 输出的第一点如果是内部 (9,7)，经过 tx_row = 8 - row 后发送为 (9,1)。
+- 这样 STM32 端看到的起点就是 (9,1)。
+- 路径点顺序不变，只改变 row 的坐标解释。
+
+
+================================================
+十一、动物上报坐标在 UI 中的显示
+文件：src/ui_node/src/mainwindow.cpp
+函数：MainWindow::refreshAnimalLabels()
+================================================
+
+void MainWindow::refreshAnimalLabels()
+{
+    uint xiang = 0;
+    uint hu = 0;
+    uint lang = 0;
+    uint hou = 0;
+    uint que = 0;
+
+    QList<QString> xiangPosition;
+    QList<QString> huPosition;
+    QList<QString> langPosition;
+    QList<QString> houPosition;
+    QList<QString> quePosition;
+
+    for (int animal = 0; animal < 5; ++animal) {
+        for (int col = 1; col <= 9; ++col) {
+            for (int row = 1; row <= 7; ++row) {
+                const int c = animalGridCount_[animal][col][row];
+                if (c <= 0) {
+                    continue;
+                }
+
+                const QString pos = " (A" + QString::number(col)
+                                  + ",B" + QString::number(row)
+                                  + ")x" + QString::number(c);
+
+                switch (animal) {
+                case 0:
+                    xiang += static_cast<uint>(c);
+                    xiangPosition.append(pos);
+                    break;
+                case 1:
+                    hu += static_cast<uint>(c);
+                    huPosition.append(pos);
+                    break;
+                case 2:
+                    lang += static_cast<uint>(c);
+                    langPosition.append(pos);
+                    break;
+                case 3:
+                    hou += static_cast<uint>(c);
+                    houPosition.append(pos);
+                    break;
+                case 4:
+                    que += static_cast<uint>(c);
+                    quePosition.append(pos);
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+    }
+
+    ui->label_6->setText(QStringLiteral("象：") + QString::number(xiang) + joinPositions(xiangPosition));
+    ui->label_7->setText(QStringLiteral("虎：") + QString::number(hu) + joinPositions(huPosition));
+    ui->label_8->setText(QStringLiteral("狼：") + QString::number(lang) + joinPositions(langPosition));
+    ui->label_9->setText(QStringLiteral("猴：") + QString::number(hou) + joinPositions(houPosition));
+    ui->label_10->setText(QStringLiteral("孔雀：") + QString::number(que) + joinPositions(quePosition));
+}
+
+解释：
+- 动物上报坐标按 A/B 形式显示。
+- 这里直接显示收到的 row，不再做 8 - row。
+- 因此要求 STM32 上报动物坐标时，也应统一使用外部坐标体系：A = col，B = row，起点方向以 (9,1) 为基准。
+
+
+================================================
+十二、当前需要注意的问题
+================================================
+
+1. 当前工程没有真正的“网格坐标 -> 物理坐标（米 / 厘米）”代码。
+   如果后续要让 STM32 或飞控执行真实运动，需要另行定义：
+   - 每个网格的实际长度，例如 cell_size_m
+   - 原点，例如 (9,1)
+   - X/Y 轴方向
+   - grid(col,row) -> real(x_m,y_m) 的公式
+
+2. 当前 UI 绘图使用的是像素坐标：gridToPixel(col,row)。
+
+3. 当前路径规划内部使用的是内部 row 坐标：起点内部为 (9,7)。
+
+4. 对 STM32 建议统一发送外部坐标：tx_row = 8 - internal_row，因此起点发送为 (9,1)。
+
+5. 动物上报建议统一使用外部坐标：animal_code, col, row, count，其中 row 直接表示 B 坐标，不再做反向转换。
